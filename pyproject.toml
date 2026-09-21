@@ -1,0 +1,20 @@
+[project]
+name = "gem"
+version = "0.3.8"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Corentin Detry", email = "corentin.detry@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "enoslib>=10.9.0",
+    "fabric>=3.2.3",
+    "pandas>=3.0.5",
+    "python-grid5000>=1.2.5",
+    "pyyaml>=6.0.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"

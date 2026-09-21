@@ -1,2 +1,1 @@
-# gem
-Grid'5000 Experimental Multicast Framework - GEM
+# GEM - Grid'5000 Experimental Multicast Framework
