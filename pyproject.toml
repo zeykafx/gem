@@ -1,6 +1,6 @@
 [project]
 name = "gem"
-version = "0.3.8"
+version = "0.3.22"
 description = "Add your description here"
 readme = "README.md"
 authors = [

@@ -70,10 +70,19 @@ class G5KExpe:
         self.current_provider: en.G5k | None = None
         self.router_tunnels = defaultdict(list)
 
+        self.TUNNEL_MTU = 1500
+        self.UNDERLAY_MTU = 9000
+        self.USE_FOU = False  # FOU = Foo over UDP, so gre over udp, spreads the msgs over rx queues
+        self.FOU_PORT = 5555
+
     def usage_policy_check(self):
         datetime_now = datetime.now()
         job_end_dt = datetime_now + self.topology.wall_time
-        if datetime_now.hour <= 17 and job_end_dt.hour >= 19 and datetime_now.weekday() < 5:
+        if (
+            datetime_now.hour <= 17
+            and job_end_dt.hour >= 19
+            and datetime_now.weekday() < 5
+        ):
             raise RuntimeError(
                 "This job reservation will violate the usage policy and will cross the day night boundary"
             )
@@ -381,6 +390,20 @@ class G5KExpe:
                 roles=self.roles, pattern_hosts=role, gather_facts=False
             ) as p:
                 # NOTE: the commands below will run as root iif the ssh keys setup in g5k are present on the current machine
+
+                p.shell(
+                    """
+                    for NS_NAME in $(ip netns list | awk '{print $1}' | grep '^client-'); do
+                        ip netns pids "$NS_NAME" | xargs -r kill -9
+                        ip netns delete "$NS_NAME"
+                    done
+                    for LINK in $(ip -o link show type macvlan | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^mv-c'); do
+                        ip link delete "$LINK"
+                    done
+                    true
+                    """,
+                    task_name="cleanup_macvlan_namespaces",
+                )
                 p.shell(
                     """
                     NS_NAME="client-{{ item.id }}"
@@ -393,7 +416,8 @@ class G5KExpe:
                     ip netns add "$NS_NAME"
 
                     # create a MACVLAN interface on the prod interface
-                    ip link add "$MACVLAN_HOST" link "$PROD_IFACE" type macvlan mode bridge
+                    # bclim -1 is only available on debian 13 because it was added in v6.12 of the kernel
+                    ip link add "$MACVLAN_HOST" link "$PROD_IFACE" type macvlan mode bridge bcqueuelen 4096
                     ip link set "$MACVLAN_HOST" netns "$NS_NAME"
 
                     # configure the netns interface
@@ -430,6 +454,50 @@ class G5KExpe:
             return host_ips[0]
         raise RuntimeError(f"Could get prod ip for '{host.address}'")
 
+    def _router_base_cmds(self, peer_prod_ip):
+        cmds = [
+            "set -ex",  # don't ignore errs
+            # remove previous tunnels
+            "for L in $(ip -o link show type gre | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -v '^gre0$'); do sudo ip link del \"$L\"; done",
+            # disable FOU if it was used before
+            f"sudo ip fou del port {self.FOU_PORT} 2>/dev/null || true", 
+            # get the prod iface, the one used to reach the other router
+            rf"DEV=$(ip -o route get {peer_prod_ip} | sed -n 's/.* dev \([^ ]*\).*/\1/p')",
+            f"sudo ip link set $DEV mtu {self.UNDERLAY_MTU}",
+            # increase the NIC ring and backlog
+            # "sudo ethtool -G $DEV rx 4096 tx 4096 2>/dev/null || true",
+            "MAX_RX=$(ethtool -g $DEV | awk '/Pre-set/{p=1} p&&/^RX:/{print $2; exit}')",
+            "MAX_JUMBO=$(ethtool -g $DEV | awk '/Pre-set/{p=1} p&&/^RX Jumbo:/{print $3; exit}')",
+            "case "$MAX_JUMBO" in ''|*[!0-9]*) J="";; *) J="rx-jumbo $MAX_JUMBO";; esac",
+            "sudo ethtool -G $DEV rx $MAX_RX $J || true",   # ethtool exits 1 when nothing changes
+            "ethtool -g $DEV | sed -n '/Current/,$p",'      # log what was actually applied
+            "sudo sysctl -qw net.core.netdev_max_backlog=16384",
+            # make sure ip fwding is one
+            "sudo sysctl -qw net.ipv4.ip_forward=1",
+            "sudo sysctl -qw net.ipv4.conf.all.rp_filter=0",
+        ]
+        if self.USE_FOU:
+            cmds += [
+                "sudo modprobe fou",
+                f"sudo ip fou del port {self.FOU_PORT} 2>/dev/null || true",
+                f"sudo ip fou add port {self.FOU_PORT} ipproto 47",
+            ]
+        return cmds
+
+    def _gre_cmds(self, iface, local, remote, tunnel_ip):
+        encap = (
+            f" encap fou encap-sport auto encap-dport {self.FOU_PORT}"
+            if self.USE_FOU
+            else ""
+        )
+        return [
+            f"sudo ip link del {iface} 2>/dev/null || true",
+            f"sudo ip link add {iface} type gre local {local} remote {remote} ttl 255{encap}",
+            f"sudo ip link set {iface} mtu {self.TUNNEL_MTU} multicast on up",
+            f"sudo ip addr replace {tunnel_ip}/30 dev {iface}",
+            f"sudo sysctl -qw net.ipv4.conf.{iface}.rp_filter=0",
+        ]
+
     def setup_gre_tunnels(self):
         # per router tunnel info: router_tunnels[role] -> list of {iface, ip, network, tunnel_subnet}
         # used for the FRRouting configuration
@@ -443,6 +511,7 @@ class G5KExpe:
         router_gre_cmds = defaultdict(list)
 
         tunnel_base = int(ip_address("192.168.0.0"))
+        peer_ips = defaultdict(list)  # role -> peer tunnel ip, used for the mtu check
 
         for link_idx, (role_a, role_b) in enumerate(self.topology.links):
 
@@ -457,73 +526,48 @@ class G5KExpe:
             tunnel_ip_a = str(tunnel_subnet.network_address + 1)
             tunnel_ip_b = str(tunnel_subnet.network_address + 2)
 
-            # GRE interface names
-            gre_counter[role_a] += 1
-            gre_counter[role_b] += 1
-            gre_iface_a = f"gre{gre_counter[role_a]}"
-            gre_iface_b = f"gre{gre_counter[role_b]}"
-
-            # tunnel metadata used in FRR config
-            self.router_tunnels[role_a].append(
-                {
-                    "iface": gre_iface_a,
-                    "ip": tunnel_ip_a,
-                    "network": str(tunnel_subnet.network_address),
-                    "tunnel_subnet": tunnel_subnet,
-                }
-            )
-            self.router_tunnels[role_b].append(
-                {
-                    "iface": gre_iface_b,
-                    "ip": tunnel_ip_b,
-                    "network": str(tunnel_subnet.network_address),
-                    "tunnel_subnet": tunnel_subnet,
-                }
-            )
-
-            # GRE commands for side A
-            router_gre_cmds[role_a].extend(
-                [
-                    f"sudo ip link del {gre_iface_a} 2>/dev/null || true",
-                    f"sudo ip tunnel add {gre_iface_a} mode gre local {prod_ip_a} remote {prod_ip_b} ttl 255",
-                    f"sudo ip addr add {tunnel_ip_a}/30 dev {gre_iface_a}",
-                    f"sudo ip link set {gre_iface_a} up",
-                    f"sudo ip link set {gre_iface_a} multicast on",
-                    f"sudo sysctl -w net.ipv4.conf.{gre_iface_a}.rp_filter=0",
-                    "sudo sysctl -w net.ipv4.conf.all.rp_filter=0",
-                ]
-            )
-
-            # GRE commands for side B
-            router_gre_cmds[role_b].extend(
-                [
-                    f"sudo ip link del {gre_iface_b} 2>/dev/null || true",
-                    f"sudo ip tunnel add {gre_iface_b} mode gre local {prod_ip_b} remote {prod_ip_a} ttl 255",
-                    f"sudo ip addr add {tunnel_ip_b}/30 dev {gre_iface_b}",
-                    f"sudo ip link set {gre_iface_b} up",
-                    f"sudo ip link set {gre_iface_b} multicast on",
-                    f"sudo sysctl -w net.ipv4.conf.{gre_iface_b}.rp_filter=0",
-                    "sudo sysctl -w net.ipv4.conf.all.rp_filter=0",
-                ]
-            )
+            for role, local, remote, ip, peer_ip in (
+                (role_a, prod_ip_a, prod_ip_b, tunnel_ip_a, tunnel_ip_b),
+                (role_b, prod_ip_b, prod_ip_a, tunnel_ip_b, tunnel_ip_a),
+            ):
+                gre_counter[role] += 1
+                iface = f"gre{gre_counter[role]}"
+                self.router_tunnels[role].append(
+                    {
+                        "iface": iface,
+                        "ip": ip,
+                        "network": str(tunnel_subnet.network_address),
+                        "tunnel_subnet": tunnel_subnet,
+                    }
+                )
+                if role not in router_gre_cmds:
+                    router_gre_cmds[role] = self._router_base_cmds(remote)
+                router_gre_cmds[role] += self._gre_cmds(iface, local, remote, ip)
+                peer_ips[role].append(peer_ip)
 
             print(
-                f"Link {link_idx}: {gre_iface_a}({role_a}, {tunnel_ip_a}) <-> {gre_iface_b}({role_b}, {tunnel_ip_b})"
+                f"Link {link_idx}: {role_a} ({tunnel_ip_a}) <-> {role_b} ({tunnel_ip_b})"
             )
 
         for role, cmds in router_gre_cmds.items():
-            host = self.roles[role][0]
             en.run_command(
                 "; ".join(cmds),
                 task_name=f"setup_gre_{role}",
-                roles=host,
+                roles=self.roles[role][0],
                 gather_facts=False,
             )
-            print(
-                f"Created {len(self.router_tunnels[role])} GRE tunnels on {role} ({host.address})"
-            )
 
-        print(f"Router tunnels: {dict(self.router_tunnels)}")
+        # check if tunnels can carry full size packets unfragmented
+        for role, ips in peer_ips.items():
+            pings = [
+                f"ping -M do -s {self.TUNNEL_MTU - 28} -c 3 -W 1 {ip}" for ip in ips
+            ]
+            en.run_command(
+                "set -e; " + "; ".join(pings),
+                task_name=f"check_gre_mtu_{role}",
+                roles=self.roles[role][0],
+                gather_facts=False,
+            )
 
     def parse_subnet(self, subnet_obj):
         for attr in ("network", "cidr", None):
@@ -679,7 +723,7 @@ class G5KExpe:
                 f"[{role}] {host.address}  prod={prod_ip}  loopback={lo_addr}  gateway={gateway}  tunnels={len(tunnels)}"
             )
 
-    def get_global_ip_for_router_role(self, router_role) -> str:
+    def get_global_ip_for_router_role(self, router_role, get_prod_ip: bool) -> str:
         local_subnet = ip_network(
             "10.0.0.0/8"
         )  # the subnets we get are in 10..../8, can't be more specific than that sadly
@@ -689,46 +733,59 @@ class G5KExpe:
         host_ips = [
             str(ip)
             for ip in self.node_ips[router_role]
-            if ip_address(ip) not in local_subnet
+            if (ip_address(ip) not in local_subnet and not get_prod_ip)
+            or (get_prod_ip and ip_address(ip) in local_subnet)
         ]
         if host_ips:
             return host_ips[0]
         raise RuntimeError(f"Could get prod ip for {router_role}")
 
-    def set_default_route_on_host(self, host_alias, cmd, gateway_ip, host_iface):
+    def set_routes_on_host(self, host_address, cmd, gateway_ip, host_iface):
+        # connect as root so that `ip -batch` doesn't need sudo (and a password)
         result = subprocess.run(
-            ["ssh", host_alias, cmd],
+            ["ssh", f"root@{host_address}", cmd],
             capture_output=True,
             text=True,
             check=False,
         )
         if result.returncode != 0:
-            print(f"Error on {host_alias}: {result.stderr.strip()}")
+            print(f"Error on {host_address}: {result.stderr.strip()}")
         else:
-            out = result.stdout.strip().splitlines()
-            if out:
-                print(out[0])
-            print(f"{host_alias}'s default route is {gateway_ip} on {host_iface}")
+            print(result.stdout.strip())
+            print(
+                f"{host_address} routes the experiment subnets via {gateway_ip} on {host_iface}"
+            )
 
     def setup_default_routes(self):
-        # figure out the gateway router for the server, each client, and each relay
+        # the experiment subnet each host role lives in, and the router it should use
+        subnet_per_role = {"server": "subnet_server"}
         gateway_router_role = {"server": "router_server"}
         for i in range(len(self.topology.client_clusters)):
-            gateway_router_role[f"client_{i}"] = f"router_client_{i}"
+            subnet_per_role[f"relay_{i}"] = f"subnet_client_{i}"
             gateway_router_role[f"relay_{i}"] = f"router_client_{i}"
+            # NOTE: the clients' root namespace carries no experiment traffic,
+            # the namespaces created in netns_setup_macvlan already use the router as gateway
 
-        # Collect all tasks (host_alias, command, gateway_ip, iface) first, then run in parallel
+        experiment_subnets = {
+            key: str(self.parse_subnet(self.networks[key][0]))
+            for key in ["subnet_server"]
+            + [f"subnet_client_{i}" for i in range(len(self.topology.client_clusters))]
+        }
+
+        # Collect all tasks (host_address, command, gateway_ip, iface) first, then run in parallel
         route_tasks = []
 
         for role, router_role in gateway_router_role.items():
 
-            # skip any bad role written above
+            # relays are only reserved if enabled in the topology
             if role not in self.roles or not self.roles[role]:
                 print(f"Unknown role: {role}")
                 continue
 
-            gateway_ip = self.get_global_ip_for_router_role(router_role)
-            print(gateway_ip)
+            gateway_ip = self.get_global_ip_for_router_role(router_role, True)
+            print(
+                f"Gateway IP for {role} (address of router '{router_role}') is {gateway_ip}"
+            )
 
             for host in self.roles[role]:
                 host_iface = self.prod_interfaces_per_node.get(host.address)
@@ -736,20 +793,33 @@ class G5KExpe:
                     raise RuntimeError(
                         f"Missing prod interface for node '{host.address}'"
                     )
+                host_ip = host.extra["ips"][0]
 
+                batch = []
+                for subnet_key, subnet in experiment_subnets.items():
+                    if subnet_key == subnet_per_role[role]:
+                        # own subnet: reach the other hosts directly, like the namespaces do with their /22
+                        batch.append(
+                            f"route replace {subnet} dev {host_iface} src {host_ip}"
+                        )
+                    else:
+                        batch.append(
+                            f"route replace {subnet} via {gateway_ip} dev {host_iface} onlink src {host_ip}"
+                        )
+
+                # all routes are applied by a single `ip -batch` process
                 cmd = "; ".join(
                     [
-                        f"sudo ip route replace default via {gateway_ip} dev {host_iface}",
-                        "sudo ip route flush cache",
-                        "ip route show default",
+                        "printf '" + "\\n".join(batch) + "\\n' | ip -batch -",
+                        f"ip route show dev {host_iface} | grep ' src {host_ip}'",
                     ]
                 )
 
-                route_tasks.append((host.alias, cmd, gateway_ip, host_iface))
+                route_tasks.append((host.address, cmd, gateway_ip, host_iface))
 
-        print(f"setting default routes on {len(route_tasks)} nodes")
+        print(f"setting experiment routes on {len(route_tasks)} nodes")
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            pool.map(lambda t: self.set_default_route_on_host(*t), route_tasks)
+            pool.map(lambda t: self.set_routes_on_host(*t), route_tasks)
 
     def push_binaries(
         self,

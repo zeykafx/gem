@@ -16,9 +16,9 @@ def _report(label, results, elapsed, *, quiet=False, verb="done"):
     if total == 0 or (quiet and failed == 0):
         return
 
-    line = f"  [{label}] {verb} on {total - failed}/{total} host(s) in {elapsed:.1f}s"
+    line = f"  ({label}) {verb} on {total - failed}/{total} hosts in {elapsed:.1f}s"
     if failed:
-        line += f"  ** {failed} host(s) FAILED **"
+        line += f"  {failed} hosts failed!"
     print(line)
 
 
@@ -52,7 +52,7 @@ def _host_with_vars(host, user, **variables):
 
 
 def bg_inner_cmd(stdout, stderr, cmd):
-    # Start cmd on each host with setsid so it survives SSH channel close
+    # Start cmd on each host with setsid so it survives SSH channel closing
     return (
         f'mkdir -p "$(dirname {stdout})" "$(dirname {stderr})" && '
         f"setsid bash -c {shlex.quote(cmd)} > {stdout} 2> {stderr} < /dev/null &"

@@ -140,9 +140,10 @@ def run_eval(matrix, cfg, run_once, test_name, row_fields, metrics):
     - `matrix` contains the runs to execute
     - `cfg` = run loop config; must provide `n_runs`, `n_supplementary_runs` and
       `local_out_dir`
-    - `run_once(cfg, rc, run_index, test_name) -> (results, cpu_samples)`:
+    - `run_once(cfg, rc, run_index, test_name) -> (results, cpu_samples[, extra_rows])`:
       experiment specific way of organizing a single run. `results` maps each
-      metric key to its list of values
+      metric key to its list of values. The optional `extra_rows` maps a name to a list
+      of row dicts, each name is written to "test_name_name.csv" with the run identifying columns added
     - `row_fields(rc) -> dict` function that returns the columns that are used to identify a run `rc` in the results csv
     - `metrics`: the `MetricSpec`s collected by `run_once`; the first one is the
       primary metric (a run is only retried if it produced no value for it)
@@ -163,6 +164,7 @@ def run_eval(matrix, cfg, run_once, test_name, row_fields, metrics):
     idx_per_metric: dict[str, int] = {metric.key: 0 for metric in metrics}
     cpu_rows, cpu_idx = [], 0
     extra_keys: list[str] = []
+    other_rows: dict[str, list] = {}
 
     for rc in matrix:
         extra = row_fields(rc)
@@ -178,7 +180,7 @@ def run_eval(matrix, cfg, run_once, test_name, row_fields, metrics):
 
             # run the test
             try:
-                results, cpu = run_once(cfg, rc, successful, test_name)
+                results, cpu, *others = run_once(cfg, rc, successful, test_name)
             except Exception as e:
                 print(f"failed: {e}")
                 continue
@@ -214,6 +216,12 @@ def run_eval(matrix, cfg, run_once, test_name, row_fields, metrics):
                     }
                 )
                 cpu_idx += 1
+            for name, rows in (others[0] if others else {}).items():
+                table = other_rows.setdefault(name, [])
+                for row in rows:
+                    table.append(
+                        {"index": len(table), **extra, "run_index": successful, **row}
+                    )
             successful += 1
 
     elapsed = time.time() - start
@@ -243,5 +251,11 @@ def run_eval(matrix, cfg, run_once, test_name, row_fields, metrics):
             ],
             rows=cpu_rows,
         )
+
+    for name, rows in other_rows.items():
+        if rows:
+            path = Path(cfg.local_out_dir) / f"{test_name}_{name}.csv"
+            write_csv(path, rows=rows, fieldnames=list(rows[0].keys()))
+            paths[name] = path
 
     return paths
