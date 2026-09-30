@@ -1,5 +1,6 @@
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from itertools import islice
 import logging
 from typing import Sequence
@@ -36,6 +37,7 @@ class G5KExpe:
         """
         conf_file = os.path.join(os.environ.get("HOME"), g5k_conf_file_loc)  # type: ignore
         gk = Grid5000.from_yaml(conf_file)
+        self.gk = gk
 
         self.topology: Topology = load_topology(path=topology_conf)
 
@@ -85,6 +87,87 @@ class G5KExpe:
         ):
             raise RuntimeError(
                 "This job reservation will violate the usage policy and will cross the day night boundary"
+            )
+
+        self.daytime_core_hours_check()
+
+    @staticmethod
+    def daytime_hours_per_day(start: datetime, end: datetime) -> dict[date, float]:
+        """
+        Returns, for each working day touched by [start, end], the number of hours
+        of that interval falling within 09:00-19:00
+        """
+        hours = {}
+        day = start.date()
+        while day <= end.date():
+            if day.weekday() < 5 and day:
+                day_start = datetime.combine(day, time(9), tzinfo=start.tzinfo)
+                day_end = datetime.combine(day, time(19), tzinfo=start.tzinfo)
+                overlap = min(end, day_end) - max(start, day_start)
+                if overlap > timedelta(0):
+                    hours[day] = overlap / timedelta(hours=1)
+            day += timedelta(days=1)
+        return hours
+
+    def reserved_nodes_per_cluster(self) -> dict[str, int]:
+        # mirrors what setup_enoslib_conf reserves
+        nodes = defaultdict(int)
+        # there are two nodes in the server cluster, the server and the router
+        nodes[self.topology.server.cluster] += 1 + self.topology.server.nodes
+        for client_cluster in self.topology.client_clusters:
+            # for each client cluster, we have n clients + 1 router + possibly 1 relay
+            nodes[client_cluster["cluster"]] += 1 + client_cluster["num_clients"]
+            if self.topology.relay_nodes is True:
+                nodes[client_cluster["cluster"]] += 1
+
+        return dict(nodes)
+
+    def daytime_core_hours_check(self, start: datetime | None = None):
+        """
+        Checks the usage rule: "Between 09:00 and 19:00 during working days (Monday to Friday, excluding public holidays in France),
+                                you should not use more than the equivalent of 2 hours on all the cores of the cluster during a given day 
+                                (e.g. on a 64 bi-processor (quad core) cluster, you should not use more than (2 hours)*(2 CPU)*(4 cores)*(64 nodes)=1024 core.hours)."
+        - `start`: when the job starts, defaults to now
+        """
+        tz = ZoneInfo("Europe/Paris")
+        start = (start or datetime.now(tz)).astimezone(tz)
+        end = start + self.topology.wall_time
+
+        daytime_hours = self.daytime_hours_per_day(start, end)
+        if not daytime_hours:
+            print("Job runs outside of working hours, the core hours limit doesn't apply")
+            return
+
+        violations = []
+        for cluster, n_nodes in self.reserved_nodes_per_cluster().items():
+            site = self.cluster_to_site[cluster]
+            # fetch the number of cores for every machine in the cluster
+            cores_per_node = [
+                node.architecture["nb_cores"]
+                for node in self.gk.sites[site].clusters[cluster].nodes.list()
+            ]
+            # the total budget is twice the total number of cores
+            budget = 2 * sum(cores_per_node)
+
+            # and since the nodes may not all have the same number of cores, we pick the max nb of cores per node and assume we pick N machines with that number of cores
+            job_cores = n_nodes * max(cores_per_node)
+
+            for day, hours in daytime_hours.items():
+                # here hours is the number of hours in day that we will use with this job
+                used = job_cores * hours
+                print(
+                    f"Cluster={cluster}: {n_nodes}/{len(cores_per_node)} nodes used, each with {max(cores_per_node)} cores, for a total of {hours:.2f} hours"
+                    f" = {used:.0f} (used) / {budget} (budget) core hours (this job will use {100 * used / budget:.0f}% of total core hours)"
+                )
+                if used > budget:
+                    violations.append(
+                        f"{cluster} on {day}: {used:.0f} > {budget} core hours"
+                    )
+
+        if violations:
+            raise RuntimeError(
+                "This job reservation will exceed the daytime core hours limit: "
+                + "; ".join(violations)
             )
 
     def setup_enoslib_conf(self) -> en.G5k:
@@ -460,7 +543,7 @@ class G5KExpe:
             # remove previous tunnels
             "for L in $(ip -o link show type gre | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -v '^gre0$'); do sudo ip link del \"$L\"; done",
             # disable FOU if it was used before
-            f"sudo ip fou del port {self.FOU_PORT} 2>/dev/null || true", 
+            f"sudo ip fou del port {self.FOU_PORT} 2>/dev/null || true",
             # get the prod iface, the one used to reach the other router
             rf"DEV=$(ip -o route get {peer_prod_ip} | sed -n 's/.* dev \([^ ]*\).*/\1/p')",
             f"sudo ip link set $DEV mtu {self.UNDERLAY_MTU}",
@@ -468,9 +551,9 @@ class G5KExpe:
             # "sudo ethtool -G $DEV rx 4096 tx 4096 2>/dev/null || true",
             "MAX_RX=$(ethtool -g $DEV | awk '/Pre-set/{p=1} p&&/^RX:/{print $2; exit}')",
             "MAX_JUMBO=$(ethtool -g $DEV | awk '/Pre-set/{p=1} p&&/^RX Jumbo:/{print $3; exit}')",
-            "case "$MAX_JUMBO" in ''|*[!0-9]*) J="";; *) J="rx-jumbo $MAX_JUMBO";; esac",
+            'case "$MAX_JUMBO" in ""|*[!0-9]*) J="";; *) J="rx-jumbo $MAX_JUMBO";; esac',
             "sudo ethtool -G $DEV rx $MAX_RX $J || true",   # ethtool exits 1 when nothing changes
-            "ethtool -g $DEV | sed -n '/Current/,$p",'      # log what was actually applied
+            "ethtool -g $DEV | sed -n '/Current/,$p'",      # log what was actually applied
             "sudo sysctl -qw net.core.netdev_max_backlog=16384",
             # make sure ip fwding is one
             "sudo sysctl -qw net.ipv4.ip_forward=1",
